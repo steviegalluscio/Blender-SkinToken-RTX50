@@ -1,11 +1,13 @@
 import bpy
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -70,28 +72,69 @@ def export_armature_json(armature_obj: bpy.types.Object, out_path: str):
         json.dump(payload, f)
 
 
-def read_proc_progress(proc: subprocess.Popen, buffer_str: str) -> tuple[str, list[tuple[int, str]]]:
-    """Reads non-blocking stdout output and returns parsed progress updates."""
-    updates = []
-    if proc.stdout is None:
-        return buffer_str, updates
+class AsyncProcessReader:
+    """Reads stdout and stderr from a subprocess asynchronously in background threads.
+    Provides non-blocking access to progress updates and stderr output across Windows, Linux, and macOS.
+    """
 
-    try:
-        raw = proc.stdout.read()
-        if raw:
-            buffer_str += raw
-            lines = buffer_str.split("\n")
-            buffer_str = lines[-1]
-            for line in lines[:-1]:
-                m = PROGRESS_PATTERN.search(line)
-                if m:
-                    pct = int(m.group(1))
-                    msg = m.group(2).strip()
-                    updates.append((pct, msg))
-    except Exception:
-        pass
+    def __init__(self, proc: subprocess.Popen):
+        self.proc = proc
+        self._queue: queue.Queue = queue.Queue()
+        self._stderr_lines: List[str] = []
 
-    return buffer_str, updates
+        self._stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def _read_stdout(self):
+        try:
+            if self.proc.stdout is not None:
+                for line in iter(self.proc.stdout.readline, ""):
+                    if not line:
+                        break
+                    self._queue.put(line)
+        except Exception:
+            pass
+        finally:
+            try:
+                if self.proc.stdout is not None:
+                    self.proc.stdout.close()
+            except Exception:
+                pass
+
+    def _read_stderr(self):
+        try:
+            if self.proc.stderr is not None:
+                for line in iter(self.proc.stderr.readline, ""):
+                    if not line:
+                        break
+                    self._stderr_lines.append(line)
+        except Exception:
+            pass
+        finally:
+            try:
+                if self.proc.stderr is not None:
+                    self.proc.stderr.close()
+            except Exception:
+                pass
+
+    def get_updates(self) -> List[Tuple[int, str]]:
+        updates = []
+        while True:
+            try:
+                line = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            m = PROGRESS_PATTERN.search(line)
+            if m:
+                pct = int(m.group(1))
+                msg = m.group(2).strip()
+                updates.append((pct, msg))
+        return updates
+
+    def get_stderr(self) -> str:
+        return "".join(self._stderr_lines).strip()
 
 
 class SKINTOKENS_OT_check_env(bpy.types.Operator):
@@ -157,8 +200,8 @@ class SKINTOKENS_OT_setup_env(bpy.types.Operator):
     bl_description = "Create isolated virtualenv and install minimal dependencies automatically"
 
     _proc: Optional[subprocess.Popen] = None
+    _reader: Optional[AsyncProcessReader] = None
     _timer = None
-    _stdout_buf: str = ""
     _venv_py: str = ""
 
     def modal(self, context, event):
@@ -180,6 +223,7 @@ class SKINTOKENS_OT_setup_env(bpy.types.Operator):
             if ret is not None:
                 if self._timer is not None:
                     wm.event_timer_remove(self._timer)
+                    self._timer = None
                 wm.progress_end()
                 context.workspace.status_text_set(None)
                 settings.is_running = False
@@ -196,7 +240,7 @@ class SKINTOKENS_OT_setup_env(bpy.types.Operator):
                     self.report({'INFO'}, f"SkinTokens Venv successfully created at: {self._venv_py}")
                     return {'FINISHED'}
                 else:
-                    err = self._proc.stderr.read() if self._proc.stderr else "Unknown venv creation failure."
+                    err = self._reader.get_stderr() if self._reader else "Unknown venv creation failure."
                     self.report({'ERROR'}, f"Setup failed (code {ret}):\n{err}")
                     return {'CANCELLED'}
 
@@ -212,9 +256,9 @@ class SKINTOKENS_OT_setup_env(bpy.types.Operator):
         # Setup bash/cmd script to create venv and pip install
         sys_py = shutil.which("python3") or sys.executable
         pip_cmd = (
-            f"\"{sys_py}\" -m venv \"{cache_dir}\" && "
-            f"\"{self._venv_py}\" -m pip install --upgrade pip && "
-            f"\"{self._venv_py}\" -m pip install torch transformers einops huggingface_hub scipy numpy"
+            f'"{sys_py}" -m venv "{cache_dir}" && '
+            f'"{self._venv_py}" -m pip install --upgrade pip && '
+            f'"{self._venv_py}" -m pip install torch transformers einops huggingface_hub scipy numpy'
         )
 
         try:
@@ -225,6 +269,7 @@ class SKINTOKENS_OT_setup_env(bpy.types.Operator):
                 stderr=subprocess.PIPE,
                 text=True,
             )
+            self._reader = AsyncProcessReader(self._proc)
         except Exception as e:
             self.report({'ERROR'}, f"Failed to start venv installer: {e}")
             return {'CANCELLED'}
@@ -244,6 +289,7 @@ class SKINTOKENS_OT_setup_env(bpy.types.Operator):
         wm = context.window_manager
         if self._timer is not None:
             wm.event_timer_remove(self._timer)
+            self._timer = None
         wm.progress_end()
         context.workspace.status_text_set(None)
         context.scene.skintokens_settings.is_running = False
@@ -255,8 +301,8 @@ class SKINTOKENS_OT_download_ckpt(bpy.types.Operator):
     bl_description = "Download SkinTokens model weights from Hugging Face"
 
     _proc: Optional[subprocess.Popen] = None
+    _reader: Optional[AsyncProcessReader] = None
     _timer = None
-    _stdout_buf: str = ""
 
     def modal(self, context, event):
         wm = context.window_manager
@@ -273,19 +319,21 @@ class SKINTOKENS_OT_download_ckpt(bpy.types.Operator):
             if self._proc is None:
                 return {'PASS_THROUGH'}
 
-            self._stdout_buf, updates = read_proc_progress(self._proc, self._stdout_buf)
-            for pct, msg in updates:
-                wm.progress_update(pct)
-                settings.progress_percent = pct
-                settings.progress_status = msg
-                context.workspace.status_text_set(f"SkinTokens: {msg} ({pct}%)")
-                for area in context.screen.areas:
-                    area.tag_redraw()
+            if self._reader:
+                updates = self._reader.get_updates()
+                for pct, msg in updates:
+                    wm.progress_update(pct)
+                    settings.progress_percent = pct
+                    settings.progress_status = msg
+                    context.workspace.status_text_set(f"SkinTokens: {msg} ({pct}%)")
+                    for area in context.screen.areas:
+                        area.tag_redraw()
 
             ret = self._proc.poll()
             if ret is not None:
                 if self._timer is not None:
                     wm.event_timer_remove(self._timer)
+                    self._timer = None
                 wm.progress_end()
                 context.workspace.status_text_set(None)
                 settings.is_running = False
@@ -298,7 +346,7 @@ class SKINTOKENS_OT_download_ckpt(bpy.types.Operator):
                 if ret == 0:
                     self.report({'INFO'}, "SkinTokens checkpoints downloaded successfully!")
                 else:
-                    err = self._proc.stderr.read() if self._proc.stderr else "Unknown error"
+                    err = self._reader.get_stderr() if self._reader else "Unknown download failure."
                     self.report({'ERROR'}, f"Download failed: {err}")
                 return {'FINISHED'}
 
@@ -327,13 +375,11 @@ class SKINTOKENS_OT_download_ckpt(bpy.types.Operator):
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            if self._proc.stdout is not None:
-                os.set_blocking(self._proc.stdout.fileno(), False)
+            self._reader = AsyncProcessReader(self._proc)
         except Exception as e:
             self.report({'ERROR'}, f"Failed to launch download worker: {e}")
             return {'CANCELLED'}
 
-        self._stdout_buf = ""
         settings.is_running = True
         settings.progress_percent = 0
         settings.progress_status = "Connecting to Hugging Face..."
@@ -349,6 +395,7 @@ class SKINTOKENS_OT_download_ckpt(bpy.types.Operator):
         wm = context.window_manager
         if self._timer is not None:
             wm.event_timer_remove(self._timer)
+            self._timer = None
         wm.progress_end()
         context.workspace.status_text_set(None)
         context.scene.skintokens_settings.is_running = False
@@ -358,33 +405,34 @@ class SKINTOKENS_OT_auto_rig(bpy.types.Operator):
     bl_idname = "skintokens.auto_rig"
     bl_label = "Auto-Rig Active Mesh"
     bl_description = "Generate AI skeletal rig and skinning weights using SkinTokens"
-    bl_options = {'REGISTER', 'UNDO'}
 
-    skeleton_only: bpy.props.BoolProperty(
-        name="Skeleton Only",
-        description="Generate bone hierarchy only without computing vertex skinning weights",
+    use_existing_skeleton: bpy.props.BoolProperty(
+        name="Use Target Armature",
+        description="Condition skinning on the selected target armature hierarchy",
         default=False,
     ) # type: ignore
 
-    use_existing_skeleton: bpy.props.BoolProperty(
-        name="Use Existing Skeleton",
-        description="Condition skinning on selected existing Armature",
+    skeleton_only: bpy.props.BoolProperty(
+        name="Skeleton Only",
+        description="Predict skeleton bones only without generating vertex skinning weights",
         default=False,
     ) # type: ignore
 
     _proc: Optional[subprocess.Popen] = None
+    _reader: Optional[AsyncProcessReader] = None
     _timer = None
     _mesh_name: str = ""
     _armature_name: str = ""
     _temp_dir: str = ""
     _temp_obj_path: str = ""
     _output_json_path: str = ""
-    _stdout_buf: str = ""
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH' and context.mode == 'OBJECT'
+        settings = getattr(context.scene, "skintokens_settings", None)
+        if settings and settings.is_running:
+            return False
+        return context.active_object is not None and context.active_object.type == 'MESH'
 
     def modal(self, context, event):
         wm = context.window_manager
@@ -394,26 +442,28 @@ class SKINTOKENS_OT_auto_rig(bpy.types.Operator):
             if self._proc and self._proc.poll() is None:
                 self._proc.terminate()
             self.cleanup(context)
-            self.report({'WARNING'}, "SkinTokens Auto-Rig cancelled.")
+            self.report({'WARNING'}, "SkinTokens process cancelled.")
             return {'CANCELLED'}
 
         if event.type == 'TIMER':
             if self._proc is None:
                 return {'PASS_THROUGH'}
 
-            self._stdout_buf, updates = read_proc_progress(self._proc, self._stdout_buf)
-            for pct, msg in updates:
-                wm.progress_update(pct)
-                settings.progress_percent = pct
-                settings.progress_status = msg
-                context.workspace.status_text_set(f"SkinTokens: {msg} ({pct}%)")
-                for area in context.screen.areas:
-                    area.tag_redraw()
+            if self._reader:
+                updates = self._reader.get_updates()
+                for pct, msg in updates:
+                    wm.progress_update(pct)
+                    settings.progress_percent = pct
+                    settings.progress_status = msg
+                    context.workspace.status_text_set(f"SkinTokens: {msg} ({pct}%)")
+                    for area in context.screen.areas:
+                        area.tag_redraw()
 
             ret = self._proc.poll()
             if ret is not None:
                 if self._timer is not None:
                     wm.event_timer_remove(self._timer)
+                    self._timer = None
                 wm.progress_end()
                 context.workspace.status_text_set(None)
                 settings.is_running = False
@@ -472,7 +522,7 @@ class SKINTOKENS_OT_auto_rig(bpy.types.Operator):
                     except Exception as e:
                         self.report({'ERROR'}, f"Failed to build rig: {e}")
                 else:
-                    err = self._proc.stderr.read() if self._proc.stderr else "Unknown worker failure."
+                    err = self._reader.get_stderr() if self._reader else "Unknown worker failure."
                     self.report({'ERROR'}, f"SkinTokens worker error (code {ret}):\n{err}")
 
                 self.cleanup(context)
@@ -545,14 +595,12 @@ class SKINTOKENS_OT_auto_rig(bpy.types.Operator):
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            if self._proc.stdout is not None:
-                os.set_blocking(self._proc.stdout.fileno(), False)
+            self._reader = AsyncProcessReader(self._proc)
         except Exception as e:
             self.report({'ERROR'}, f"Failed to start SkinTokens worker: {e}\nCheck Python path in Preferences.")
             self.cleanup(context)
             return {'CANCELLED'}
 
-        self._stdout_buf = ""
         settings.is_running = True
         settings.progress_percent = 5
         settings.progress_status = "Starting AI Worker..."

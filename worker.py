@@ -270,16 +270,17 @@ def run_inference(args):
 def _pick_device() -> str:
     """Auto-detect the best available accelerator: CUDA (NVIDIA/ROCm), MPS (Apple), XPU (Intel), else CPU."""
     try:
+        import torch
         if torch.cuda.is_available():
             return "cuda"
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and torch.backends.mps.is_available():
+            return "mps"
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None and torch.xpu.is_available():
+            return "xpu"
     except Exception:
         pass
-    mps = getattr(torch.backends, "mps", None)
-    if mps is not None and torch.backends.mps.is_available():
-        return "mps"
-    xpu = getattr(torch, "xpu", None)
-    if xpu is not None and torch.xpu.is_available():
-        return "xpu"
     return "cpu"
 
 
