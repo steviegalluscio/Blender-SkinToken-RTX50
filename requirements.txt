@@ -1,0 +1,6 @@
+torch>=2.2.0
+transformers>=4.45.0
+einops>=0.7.0
+huggingface_hub>=0.20.0
+scipy>=1.10.0
+numpy>=1.24.0

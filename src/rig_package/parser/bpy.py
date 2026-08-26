@@ -1,0 +1,1 @@
+# Deprecated legacy bpy parser - replaced by native rig_builder.py
