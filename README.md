@@ -1,4 +1,4 @@
-# This fork makes the add-on install PyTorch 2.7.0 with CUDA 12.8 (`2.7.0+cu128`). The original repo installed a default PyTorch package (`2.14.1+cpu`).
+# This fork makes the add-on install PyTorch 2.7.0 with CUDA 12.8 (`2.7.0+cu128`). The original repo installed a default PyTorch package (`2.14.1+cpu`). <br><br> <img width="647" height="47" alt="image" src="https://github.com/user-attachments/assets/62a231b1-1bb1-4ebd-aac3-bd1277004743"/>
 
 # SkinTokens for Blender
 
