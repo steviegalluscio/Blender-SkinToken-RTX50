@@ -1,3 +1,5 @@
+# This fork makes the add-on install PyTorch 2.7.0 with CUDA 12.8 (`2.7.0+cu128`). The original repo installed a default PyTorch package (`2.14.1+cpu`).
+
 # SkinTokens for Blender
 
 AI skeletal rigging and skinning weight prediction inside Blender. Port of [VAST-AI-Research/SkinTokens](https://github.com/VAST-AI-Research/SkinTokens). Select a mesh, press one button, get an armature with vertex group weights.
