@@ -252,13 +252,16 @@ class SKINTOKENS_OT_setup_env(bpy.types.Operator):
         cache_dir.parent.mkdir(parents=True, exist_ok=True)
         
         self._venv_py = str(cache_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python3"))
-
+        
         # Setup bash/cmd script to create venv and pip install
         sys_py = shutil.which("python3") or sys.executable
         pip_cmd = (
             f'"{sys_py}" -m venv "{cache_dir}" && '
             f'"{self._venv_py}" -m pip install --upgrade pip && '
-            f'"{self._venv_py}" -m pip install torch transformers einops huggingface_hub scipy numpy'
+            f'"{self._venv_py}" -m pip install '
+            f'torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128 && '
+            f'"{self._venv_py}" -m pip install '
+            f'transformers einops huggingface_hub scipy numpy'
         )
 
         try:
